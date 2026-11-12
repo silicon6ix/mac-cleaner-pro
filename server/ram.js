@@ -3,6 +3,8 @@
 import path from "node:path";
 import { run, cmdline, tilde, HOME } from "./util.js";
 import { makePlan } from "./plans.js";
+import { readState, writeState } from "./config.js";
+import { chromeTabs, closeOtherTabs } from "./chrome.js";
 
 const APP_DIRS = ["/Applications/", `${HOME}/Applications/`, "/System/Applications/"];
 const DEV_RUNTIMES = new Set(["node", "bun", "deno"]);
@@ -71,7 +73,7 @@ export async function processSnapshot() {
     if (!m) continue;
     const pid = +m[1];
     const started = new Date(m[4]).getTime();
-    procs.set(pid, { pid, ppid: +m[2], cpu: +m[3], lstart: m[4], startedAt: started, ageSec: Math.max(0, Math.round((Date.now() - started) / 1000)), comm: m[5], name: path.basename(m[5]), args: "", footprint: 0, compressed: 0, children: [] });
+    procs.set(pid, { pid, ppid: +m[2], cpu: +m[3], lstart: m[4].replace(/\s+/g, " "), startedAt: started, ageSec: Math.max(0, Math.round((Date.now() - started) / 1000)), comm: m[5], name: path.basename(m[5]), args: "", footprint: 0, compressed: 0, children: [] });
   }
   for (const line of args.stdout.split("\n")) {
     const m = line.match(/^\s*(\d+)\s(.*)$/);
@@ -217,7 +219,8 @@ async function devServers(procs) {
       const portSet = new Set();
       tree.forEach((pid) => portsByPid.get(pid)?.forEach((x) => portSet.add(x)));
       const anc = ancestors(procs, r.pid).map((pid) => procs.get(pid)).filter(Boolean);
-      const viaClaude = anc.some((a) => a.name === "claude" || /Claude\.app\//.test(a.comm));
+      // Started by Claude, or living in Claude's own folders (scratch servers of other sessions).
+      const viaClaude = anc.some((a) => a.name === "claude" || /Claude\.app\//.test(a.comm)) || /\/claude-\d+\/|Application Support\/Claude\//.test(`${cwdByPid.get(r.pid) || ""} ${r.args}`);
       const kind = describeNode(tree.map((pid) => procs.get(pid)?.args || "").join(" "));
       return {
         pid: r.pid,
@@ -230,6 +233,7 @@ async function devServers(procs) {
         footprint: tree.reduce((s, pid) => s + (procs.get(pid)?.footprint || 0), 0),
         processCount: tree.length,
         startedBy: viaClaude ? "claude" : anc[0]?.name || "?",
+        pids: tree,
         likelyDevServer: portSet.size > 0 || /dev server|Storybook|Package script/.test(kind),
       };
     })
@@ -240,9 +244,24 @@ export async function ramReport() {
   const [overview, procs] = await Promise.all([memoryOverview(), processSnapshot()]);
   const [sims, servers] = await Promise.all([bootedSimulators(procs), devServers(procs)]);
   const groups = groupByApp(procs);
+  // macOS reports per app only "compressed or swapped" as one number. Split it with the
+  // Mac-wide ratio of swap to compressor memory: an estimate, labelled as such on the page.
+  const swapShare = overview.swapUsed + overview.compressed > 0 ? overview.swapUsed / (overview.swapUsed + overview.compressed) : 0;
+  overview.swapShare = swapShare;
   return {
     overview,
-    apps: groups.slice(0, 25).map(({ pids, ...g }) => g),
+    apps: groups.slice(0, 25).map(({ pids, ...g }) => {
+      const set = new Set(pids);
+      const stoppable = servers.filter((sv) => sv.pids.some((pid) => set.has(pid)));
+      return {
+        ...g,
+        inRam: Math.max(0, g.footprint - g.compressed),
+        estSwap: Math.round(g.compressed * swapShare),
+        estCompressed: Math.round(g.compressed * (1 - swapShare)),
+        devServerPids: g.quittable ? [] : stoppable.map((sv) => sv.pid),
+        stopLabel: stoppable.length ? stoppable.map((sv) => sv.kind).join(", ") : null,
+      };
+    }),
     simulators: sims,
     debuggers: idleDebuggers(procs),
     devServers: servers,
@@ -276,14 +295,26 @@ async function waitForExit(pids, ms = 4000) {
   });
 }
 
-function stopStep(label, pids, lstartByPid) {
+/** Start time of just these processes (cheap identity check before signalling). */
+async function startTimes(pids) {
+  const r = await run("/bin/ps", ["-o", "pid=,lstart=", "-p", pids.join(",")]);
+  const out = new Map();
+  for (const line of r.stdout.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(.+?)\s*$/);
+    if (m) out.set(+m[1], m[2].replace(/\s+/g, " "));
+  }
+  return out;
+}
+
+function stopStep(label, pids, lstartByPid, bytes = 0) {
   return {
     label,
+    bytes,
     command: `kill -TERM ${pids.join(" ")}`,
     run: async () => {
       // Re-check identity right before stopping: a reused process number is never signalled.
-      const now = await processSnapshot();
-      const targets = pids.filter((pid) => now.get(pid)?.lstart === lstartByPid.get(pid));
+      const now = await startTimes(pids);
+      const targets = pids.filter((pid) => now.get(pid) === lstartByPid.get(pid));
       if (!targets.length) return { ok: true, message: "Already stopped." };
       for (const pid of targets) {
         try {
@@ -298,76 +329,175 @@ function stopStep(label, pids, lstartByPid) {
   };
 }
 
+// Each builder returns { steps, warnings, bytes } so single actions and the smart clean-up share them.
+
+async function simulatorSteps(procs, udids) {
+  const { devices } = await bootedSimulators(procs);
+  const chosen = devices.filter((d) => udids.includes(d.udid));
+  return {
+    bytes: chosen.reduce((s, d) => s + d.footprint, 0),
+    warnings: chosen.length ? ["Apps running in those simulators stop. Their apps and data stay on disk."] : [],
+    steps: chosen.map((d) => ({
+      label: `Shut down simulator ${d.name} (${d.runtime})`,
+      bytes: d.footprint,
+      command: cmdline("xcrun", ["simctl", "shutdown", d.udid]),
+      run: async () => {
+        const r = await run("/usr/bin/xcrun", ["simctl", "shutdown", d.udid], { timeout: 120_000 });
+        return { ok: r.ok || /current state: Shutdown/.test(r.stderr), message: r.ok ? "Shut down." : r.stderr };
+      },
+    })),
+  };
+}
+
+function debuggerSteps(procs, pids) {
+  const chosen = idleDebuggers(procs).filter((d) => d.idle && pids.includes(d.pid));
+  if (!chosen.length) return { steps: [], warnings: [], bytes: 0 };
+  return {
+    bytes: chosen.reduce((s, d) => s + d.footprint, 0),
+    warnings: ["If you are debugging an app on a real iPhone right now, its debugger helper looks idle here. Stop the debug session in Xcode first, or skip it."],
+    steps: [stopStep(`Stop ${chosen.length} idle debugger helper${chosen.length > 1 ? "s" : ""}`, chosen.map((d) => d.pid), new Map(chosen.map((d) => [d.pid, d.lstart])), chosen.reduce((s, d) => s + d.footprint, 0))],
+  };
+}
+
+async function devServerSteps(procs, pids) {
+  const chosen = (await devServers(procs)).filter((s) => pids.includes(s.pid));
+  const warnings = chosen.length ? ["Pages served by those programs stop loading until you start them again."] : [];
+  if (chosen.some((s) => s.startedBy === "claude")) warnings.push("Some were started by Claude. Stopping them can break a running Claude session's tools.");
+  return {
+    bytes: chosen.reduce((s, d) => s + d.footprint, 0),
+    warnings,
+    steps: chosen.map((s) => {
+      const tree = [s.pid, ...descendants(procs, s.pid)];
+      return stopStep(`Stop ${s.kind}${s.cwd ? ` in ${s.cwd}` : ""}${s.ports.length ? ` (port ${s.ports.join(", ")})` : ""}`, tree, new Map(tree.map((pid) => [pid, procs.get(pid).lstart])), s.footprint);
+    }),
+  };
+}
+
+async function appSteps(procs, keys) {
+  const groups = groupByApp(procs).filter((g) => g.quittable && keys.includes(g.key));
+  const steps = [];
+  const warnings = groups.length ? ["Apps get a normal Quit, so they can ask you to save. Nothing is force quit."] : [];
+  for (const g of groups) {
+    const idr = await run("/usr/bin/plutil", ["-extract", "CFBundleIdentifier", "raw", "-o", "-", `${g.bundlePath}/Contents/Info.plist`]);
+    const bundleId = idr.stdout.trim();
+    if (!bundleId) continue;
+    if (/claude/i.test(bundleId)) warnings.push("Quitting Claude closes every Claude session on this Mac, including any that is working now.");
+    if (g.containsThisTool) warnings.push(`${g.name} is running this cleaner. Quitting it closes this page's server.`);
+    const script = `with timeout of 20 seconds\ntell application id "${bundleId}" to quit\nend timeout`;
+    steps.push({
+      label: `Quit ${g.name}`,
+      bytes: g.footprint,
+      command: cmdline("osascript", ["-e", script]),
+      run: async () => {
+        const r = await run("/usr/bin/osascript", ["-e", script], { timeout: 30_000 });
+        if (!r.ok && /-1743|not allowed/i.test(r.stderr)) return { ok: false, message: "macOS blocked this. Allow it in System Settings → Privacy & Security → Automation, then try again." };
+        // Quitting can pause on a question in the app (unsaved work, a running build). Check it really closed.
+        const main = g.pids.map((pid) => procs.get(pid)).find((p) => p && p.comm.startsWith(`${g.bundlePath}/Contents/MacOS/`));
+        const left = main ? await waitForExit([main.pid], 8000) : [];
+        if (left.length) return { ok: false, message: `${g.name} is still open. It's probably waiting for you to answer a question in its window (save changes, stop a running build). Answer it there, or quit it yourself.` };
+        if (!r.ok) return { ok: false, message: r.stderr };
+        return { ok: true, message: "Quit." };
+      },
+    });
+  }
+  return { steps, warnings, bytes: steps.reduce((s, x) => s + x.bytes, 0) };
+}
+
+function chromeTabStep(tabs, chromeBytes) {
+  if (!tabs?.running || tabs.error || tabs.tabs <= 1) return { steps: [], warnings: [], bytes: 0 };
+  return {
+    bytes: 0,
+    warnings: [`Chrome closes ${tabs.tabs - 1} tab${tabs.tabs - 1 > 1 ? "s" : ""} and keeps "${tabs.keep?.title || "the tab in front"}". The list of closed tabs is saved; reopen them from the Memory page.`],
+    steps: [{ label: `Close ${tabs.tabs - 1} Chrome tabs, keep "${tabs.keep?.title || "the tab in front"}"`, bytes: 0, command: "osascript -l JavaScript (close every tab except the active tab of the front window)", run: closeOtherTabs, estimate: chromeBytes }],
+  };
+}
+
 export async function planRam(kind, ids = []) {
   const procs = await processSnapshot();
-  if (kind === "simulators") {
-    const { devices } = await bootedSimulators(procs);
-    const chosen = devices.filter((d) => ids.includes(d.udid));
-    if (!chosen.length) throw new Error("None of the chosen simulators are running now.");
-    return makePlan({
-      title: `Shut down ${chosen.length} simulator${chosen.length > 1 ? "s" : ""}`,
-      summary: "Each simulator closes like it was turned off. Its apps and data stay on disk, and you can start it again from Xcode.",
-      warnings: ["Any app you are running in these simulators stops."],
-      steps: chosen.map((d) => ({
-        label: `Shut down ${d.name} (${d.runtime})`,
-        command: cmdline("xcrun", ["simctl", "shutdown", d.udid]),
-        run: async () => {
-          const r = await run("/usr/bin/xcrun", ["simctl", "shutdown", d.udid], { timeout: 120_000 });
-          return { ok: r.ok || /current state: Shutdown/.test(r.stderr), message: r.ok ? "Shut down." : r.stderr };
-        },
-      })),
-    });
+  const built =
+    kind === "simulators" ? await simulatorSteps(procs, ids) : kind === "debuggers" ? debuggerSteps(procs, ids) : kind === "devServers" ? await devServerSteps(procs, ids) : kind === "apps" ? await appSteps(procs, ids) : null;
+  if (!built) throw new Error("Unknown action");
+  if (!built.steps.length) throw new Error("None of the chosen items are running now.");
+  const titles = { simulators: "Shut down simulators", debuggers: "Stop idle debugger helpers", devServers: "Stop Node programs", apps: "Quit apps" };
+  const summaries = {
+    simulators: "Each simulator closes like it was turned off. You can start it again from Xcode.",
+    debuggers: "Xcode starts a debugger helper (lldb-rpc-server) for each debug session and sometimes leaves it running. These aren't debugging anything on this Mac.",
+    devServers: "Each program gets a polite stop request, the same as pressing Control-C in its terminal.",
+    apps: "Each app is asked to quit, like choosing Quit from its menu.",
+  };
+  return makePlan({ title: `${titles[kind]} (${built.steps.length})`, summary: `${summaries[kind]} Frees about ${fmt(built.bytes)}.`, warnings: built.warnings, steps: built.steps, reclaimBytes: built.bytes });
+}
+
+// ---------- smart clean-up ----------
+
+// Apps kept open by default. The person can add or remove apps; that choice is saved.
+export const DEFAULT_KEEP = ["Claude", "Google Chrome", "Safari", "Arc", "Firefox", "Finder", "Terminal", "iTerm", "Warp", "Ghostty", "Xcode", "Simulator", "System Settings", "Activity Monitor", "1Password", "Visual Studio Code", "Cursor"];
+const KEEP_FILE = "keep-apps.json";
+
+export function keepList() {
+  const saved = readState(KEEP_FILE, { add: [], remove: [] });
+  return new Set([...DEFAULT_KEEP.filter((n) => !saved.remove.includes(n)), ...saved.add]);
+}
+
+export function setKeep(name, keep) {
+  const saved = readState(KEEP_FILE, { add: [], remove: [] });
+  saved.add = saved.add.filter((n) => n !== name);
+  saved.remove = saved.remove.filter((n) => n !== name);
+  if (keep && !DEFAULT_KEEP.includes(name)) saved.add.push(name);
+  if (!keep && DEFAULT_KEEP.includes(name)) saved.remove.push(name);
+  writeState(KEEP_FILE, saved);
+  return { keep: [...keepList()] };
+}
+
+/** What a one-click clean-up would do right now, with sensible defaults ticked. */
+export async function smartCandidates() {
+  const [procs, tabs] = await Promise.all([processSnapshot(), chromeTabs()]);
+  const [sims, servers] = await Promise.all([bootedSimulators(procs), devServers(procs)]);
+  const keep = keepList();
+  const groups = groupByApp(procs);
+  const chrome = groups.find((g) => g.name === "Google Chrome");
+  return {
+    simulators: sims.devices.map((d) => ({ id: d.udid, name: `${d.name} (${d.runtime})`, bytes: d.footprint, checked: true })),
+    debuggers: idleDebuggers(procs)
+      .filter((d) => d.idle)
+      .map((d) => ({ id: d.pid, name: `Debugger helper, running ${Math.round(d.ageSec / 60)} min`, bytes: d.footprint, checked: true })),
+    devServers: servers
+      .filter((s) => s.startedBy !== "claude" && (s.likelyDevServer || s.footprint > 200 * 1024 * 1024))
+      .map((s) => ({ id: s.pid, name: `${s.kind}${s.cwd ? ` in ${s.cwd}` : ""}${s.ports.length ? ` (port ${s.ports.join(", ")})` : ""}`, ageSec: s.ageSec, bytes: s.footprint, checked: s.ageSec >= 3600 })),
+    apps: groups
+      .filter((g) => g.quittable && !g.containsThisTool)
+      .map((g) => ({ id: g.key, name: g.name, bytes: g.footprint, kept: keep.has(g.name), checked: !keep.has(g.name) && g.footprint > 150 * 1024 * 1024 }))
+      .sort((a, b) => b.bytes - a.bytes),
+    chrome: { ...tabs, bytes: chrome?.footprint || 0, checked: !!(tabs.running && !tabs.error && tabs.tabs > 1) },
+    keep: [...keep],
+  };
+}
+
+export async function planSmart({ simulators = [], debuggers = [], devServers: servers = [], apps = [], chromeTabs: closeTabs = false } = {}) {
+  const procs = await processSnapshot();
+  const parts = [await simulatorSteps(procs, simulators), debuggerSteps(procs, debuggers.map(Number)), await devServerSteps(procs, servers.map(Number))];
+  const chrome = groupByApp(procs).find((g) => g.name === "Google Chrome");
+  if (closeTabs && !apps.includes(chrome?.key)) parts.push(chromeTabStep(await chromeTabs(), chrome?.footprint || 0));
+  parts.push(await appSteps(procs, apps));
+  const steps = parts.flatMap((p) => p.steps);
+  if (!steps.length) throw new Error("Nothing is selected, or the chosen items already stopped.");
+  const bytes = parts.reduce((s, p) => s + p.bytes, 0);
+  const tabsPart = steps.some((s) => s.estimate) ? " plus what Chrome's closed tabs used" : "";
+  return makePlan({
+    title: "Smart clean-up",
+    summary: `Frees about ${fmt(bytes)}${tabsPart}. Apps on your keep list stay open.`,
+    warnings: [...new Set(parts.flatMap((p) => p.warnings))],
+    steps,
+    reclaimBytes: bytes,
+  });
+}
+
+function fmt(b) {
+  const u = ["bytes", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (b >= 1000 && i < u.length - 1) {
+    b /= 1000;
+    i++;
   }
-  if (kind === "debuggers") {
-    const chosen = idleDebuggers(procs).filter((d) => d.idle && ids.includes(d.pid));
-    if (!chosen.length) throw new Error("None of the chosen debugger helpers are idle now.");
-    return makePlan({
-      title: `Stop ${chosen.length} idle debugger helper${chosen.length > 1 ? "s" : ""}`,
-      summary: "Xcode starts a debugger helper (lldb-rpc-server) for each debug session and sometimes leaves it running. These ones are not debugging anything on this Mac.",
-      warnings: ["If you are debugging an app on a real iPhone right now, the helper looks idle here. Stop the debug session in Xcode first, or skip this."],
-      steps: [stopStep(`Stop debugger helper${chosen.length > 1 ? "s" : ""}`, chosen.map((d) => d.pid), new Map(chosen.map((d) => [d.pid, d.lstart])))],
-    });
-  }
-  if (kind === "devServers") {
-    const all = await devServers(procs);
-    const chosen = all.filter((s) => ids.includes(s.pid));
-    if (!chosen.length) throw new Error("None of the chosen programs are running now.");
-    const warnings = ["Pages served by these programs stop loading until you start them again."];
-    if (chosen.some((s) => s.startedBy === "claude")) warnings.push("Some of these were started by Claude. Stopping them can break a running Claude session's tools.");
-    return makePlan({
-      title: `Stop ${chosen.length} Node program${chosen.length > 1 ? "s" : ""}`,
-      summary: "Each program gets a polite stop request, the same as pressing Control-C in its terminal.",
-      warnings,
-      steps: chosen.map((s) => {
-        const tree = [s.pid, ...descendants(procs, s.pid)];
-        return stopStep(`Stop ${s.kind}${s.cwd ? ` in ${s.cwd}` : ""}${s.ports.length ? ` (port ${s.ports.join(", ")})` : ""}`, tree, new Map(tree.map((pid) => [pid, procs.get(pid).lstart])));
-      }),
-    });
-  }
-  if (kind === "apps") {
-    const groups = groupByApp(procs).filter((g) => g.quittable && ids.includes(g.key));
-    if (!groups.length) throw new Error("None of the chosen apps are running now.");
-    const steps = [];
-    const warnings = ["Apps get a normal Quit, so they can ask you to save. Nothing is force quit."];
-    for (const g of groups) {
-      const idr = await run("/usr/bin/plutil", ["-extract", "CFBundleIdentifier", "raw", "-o", "-", `${g.bundlePath}/Contents/Info.plist`]);
-      const bundleId = idr.stdout.trim();
-      if (!bundleId) continue;
-      if (/claude/i.test(bundleId)) warnings.push("Quitting Claude closes every Claude session on this Mac, including any that is working now.");
-      if (g.containsThisTool) warnings.push(`${g.name} is running this cleaner. Quitting it closes this page's server.`);
-      const script = `tell application id "${bundleId}" to quit`;
-      steps.push({
-        label: `Quit ${g.name}`,
-        command: cmdline("osascript", ["-e", script]),
-        run: async () => {
-          const r = await run("/usr/bin/osascript", ["-e", script], { timeout: 60_000 });
-          if (!r.ok) return { ok: false, message: /-1743|not allowed/i.test(r.stderr) ? "macOS blocked this. Allow it in System Settings → Privacy & Security → Automation, then try again." : r.stderr };
-          return { ok: true, message: "Asked to quit." };
-        },
-      });
-    }
-    if (!steps.length) throw new Error("Couldn't find these apps' bundle ids.");
-    return makePlan({ title: `Quit ${steps.length} app${steps.length > 1 ? "s" : ""}`, summary: "Each app is asked to quit, like choosing Quit from its menu.", warnings, steps });
-  }
-  throw new Error("Unknown action");
+  return `${i === 0 ? b : b.toFixed(b >= 100 ? 0 : 1)} ${u[i]}`;
 }

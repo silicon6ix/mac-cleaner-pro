@@ -32,7 +32,21 @@ There is also a **Practice mode** switch at the bottom of the sidebar. While it 
 
 Shows how much memory is in use, how much has spilled into swap (memory moved to disk, which slows everything down), how much is compressed, and macOS's own memory pressure reading.
 
-Apps are grouped by the app they belong to (all of Chrome's helper processes count as Chrome). The memory figure for each app includes the part macOS compressed or moved to swap, so an app you haven't touched in hours still shows its real weight. The orange part of each bar is that compressed or swapped part.
+The RAM card splits your memory chips into apps, system (wired), compressed, cached files and free. The swap card shows how much memory was pushed out to the SSD.
+
+Apps are grouped by the app they belong to (all of Chrome's helper processes count as Chrome). Each app is split three ways: **in RAM**, **compressed in RAM** and **in swap on disk**, and you can sort by any of them. macOS only reports "compressed or swapped" per app as one number (without admin rights), so the split between those two uses the Mac-wide ratio of swap to compressed memory and is marked as an estimate. The in-RAM part is exact.
+
+Dev servers that show up in the app list (for example "Next.js server") get a tick box too; ticking one stops that server.
+
+#### Smart clean-up
+
+One button at the top of the Memory page. It opens a checklist of what it would do right now:
+
+- **Chrome tabs**: close every tab except the one in front of the front window. The closed tabs are saved in `~/.mac-cleaner-pro/closed-tabs/` (as a list and as a page of links), and **Closed Chrome tabs → Reopen** opens them again.
+- **Quit apps** that aren't on your keep list. Apps over 150 MB are ticked; smaller ones are folded away. **Always keep open** adds an app to the keep list; the default list is Claude, the browsers, Finder, Terminal-style apps, Xcode, Simulator, System Settings, Activity Monitor, 1Password, VS Code and Cursor. The list is saved in `~/.mac-cleaner-pro/keep-apps.json`.
+- **Shut down simulators**, **stop idle debugger helpers**, and **stop dev servers** (ones running over an hour are ticked; programs Claude started are left alone).
+
+**Review…** shows the usual preview, then the run shows live progress.
 
 | Action | What it does | Command it runs |
 |---|---|---|
@@ -42,6 +56,10 @@ Apps are grouped by the app they belong to (all of Chrome's helper processes cou
 | **Quit apps** | Asks the apps you tick to quit, like choosing Quit from their menu, so they can ask you to save. Nothing is force quit. The first time, macOS may ask you to allow this. | `osascript -e 'tell application id "<bundle id>" to quit'` |
 
 Before stopping anything, the server checks again that each process is the same one you saw (same number and same start time), so a recycled process number is never hit.
+
+If an app doesn't close because it's asking something in its own window (save changes, stop a running build), the result says so instead of waiting.
+
+Controlling Chrome and quitting apps use Apple Events, so the first time macOS asks you to allow it (System Settings → Privacy & Security → Automation).
 
 ### Disk space
 
@@ -80,7 +98,8 @@ The undo history is kept in `~/.mac-cleaner-pro/startup-undo.json`.
 
 - The server listens on `127.0.0.1` only, so nothing else on your network can reach it.
 - Each run makes a new secret that only its own page knows. Requests without it, or from another web address, are refused. That stops other websites from sending actions to it.
-- Every change is a two-step preview and confirm. The confirm runs exactly the previewed plan; a preview works once and expires after 15 minutes.
+- Every change is a two-step preview and confirm, then runs with live progress: each step shows waiting, working, done or failed, with how much has been freed so far. **Stop after this step** ends a run early; **Hide** lets it keep going while a progress chip sits in the sidebar (and a reloaded page picks the run up again).
+- The confirm runs exactly the previewed plan; a preview works once and expires after 15 minutes.
 - It never runs `sudo`. Anything that needs admin rights is shown as a command for you to run.
 - It never touches your documents or project source.
 
@@ -105,8 +124,9 @@ Plain Node.js (no packages) and a plain HTML/CSS/JS page.
 | File | Job |
 |---|---|
 | `server/index.js` | Web server, host and secret checks, routes. |
-| `server/plans.js` | Preview → confirm plans, practice runs. |
-| `server/ram.js` | Memory figures, process grouping, simulators, debugger helpers, dev servers, quitting apps. |
+| `server/plans.js` | Preview → confirm plans, practice runs, background jobs with progress. |
+| `server/chrome.js` | Count, close and reopen Chrome tabs. |
+| `server/ram.js` | Memory figures, RAM/swap split, process grouping, simulators, debugger helpers, dev servers, quitting apps, smart clean-up. |
 | `server/disk.js` | Disk scan, sizes, the safety fence, cleaning. |
 | `server/startup.js` | Login items, launch agents and daemons, turn off / on / undo. |
 | `server/selftest.js` | `npm run check`. |

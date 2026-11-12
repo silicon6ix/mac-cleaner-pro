@@ -4,10 +4,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { ramReport, planRam } from "./ram.js";
+import { ramReport, planRam, smartCandidates, planSmart, setKeep } from "./ram.js";
+import { closedTabBatches, readBatch, reopenBatch } from "./chrome.js";
+import { makePlan } from "./plans.js";
 import { startScan, publicScan, planDisk, diskFree } from "./disk.js";
 import { startupReport, planStartup } from "./startup.js";
-import { executePlan, DRY_RUN_FORCED } from "./plans.js";
+import { startPlan, getJob, stopJob, runningJob, DRY_RUN_FORCED } from "./plans.js";
 import { run } from "./util.js";
 
 const HOST = "127.0.0.1";
@@ -39,9 +41,25 @@ const routes = {
   "POST /api/disk/scan": async () => ({ scan: startScan(), free: await diskFree() }),
   "GET /api/startup": () => startupReport(),
   "POST /api/plan/ram": (b) => planRam(b.kind, b.ids || []),
+  "GET /api/smart": () => smartCandidates(),
+  "POST /api/plan/smart": (b) => planSmart(b),
+  "POST /api/keep": (b) => setKeep(String(b.name || ""), !!b.keep),
+  "GET /api/tabs/closed": () => ({ batches: closedTabBatches() }),
+  "POST /api/plan/reopen-tabs": (b) => {
+    const batch = readBatch(String(b.id || ""));
+    if (!batch) throw new Error("That list of tabs is gone.");
+    return makePlan({
+      title: `Reopen ${batch.tabs.length} Chrome tabs`,
+      summary: `Opens the tabs closed on ${new Date(batch.at).toLocaleString()} again in Chrome.`,
+      steps: [{ label: `Open ${batch.tabs.length} tabs in Chrome`, command: `open -a "Google Chrome" <${batch.tabs.length} URLs>`, run: () => reopenBatch(b.id) }],
+    });
+  },
   "POST /api/plan/disk": (b) => planDisk(b.ids || [], { unlock: b.unlock || [], deleteNow: !!b.deleteNow }),
   "POST /api/plan/startup": (b) => planStartup(b.action, b),
-  "POST /api/execute": (b) => executePlan(b.planId, { dryRun: !!b.dryRun }),
+  "POST /api/execute": (b) => startPlan(b.planId, { dryRun: !!b.dryRun }),
+  "POST /api/job": (b) => getJob(b.id),
+  "POST /api/job/stop": (b) => stopJob(b.id),
+  "GET /api/job/running": () => ({ job: runningJob() }),
   "POST /api/reveal": async (b) => {
     // Show a scanned item in Finder. Only paths under the home folder.
     const p = String(b.path || "").replace(/^~(?=\/)/, process.env.HOME);

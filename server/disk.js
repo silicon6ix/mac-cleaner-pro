@@ -379,6 +379,7 @@ export async function planDisk(itemIds, { unlock = [], deleteNow = false } = {})
     for (const i of checked) {
       steps.push({
         label: `${label}: ${i.name}`,
+        bytes: i.size || 0,
         command: deleteNow ? cmdline("rm", ["-rf", i.real]) : cmdline("trash", [i.real]),
         run: async () => {
           const real = await fs.realpath(i.path).catch(() => null);
@@ -397,13 +398,13 @@ export async function planDisk(itemIds, { unlock = [], deleteNow = false } = {})
     else warnings.push("Items go to the Trash, so you can put them back. The space comes back after you empty the Trash.");
   }
   for (const i of chosen.filter((x) => x.action === "sim-delete")) {
-    steps.push({ label: `Delete simulator ${i.name}`, command: cmdline("xcrun", ["simctl", "delete", i.udid]), run: () => simctl(["delete", i.udid]) });
+    steps.push({ label: `Delete simulator ${i.name}`, bytes: i.size || 0, command: cmdline("xcrun", ["simctl", "delete", i.udid]), run: () => simctl(["delete", i.udid]) });
   }
-  if (chosen.some((i) => i.action === "sim-delete-unavailable")) {
-    steps.push({ label: "Delete broken simulators", command: cmdline("xcrun", ["simctl", "delete", "unavailable"]), run: () => simctl(["delete", "unavailable"]) });
+  for (const i of chosen.filter((x) => x.action === "sim-delete-unavailable")) {
+    steps.push({ label: "Delete broken simulators", bytes: i.size || 0, command: cmdline("xcrun", ["simctl", "delete", "unavailable"]), run: () => simctl(["delete", "unavailable"]) });
   }
   for (const i of chosen.filter((x) => x.action === "runtime-delete")) {
-    steps.push({ label: `Remove ${i.name}`, command: cmdline("xcrun", ["simctl", "runtime", "delete", i.runtimeId]), run: () => simctl(["runtime", "delete", i.runtimeId], 600_000) });
+    steps.push({ label: `Remove ${i.name}`, bytes: i.size || 0, command: cmdline("xcrun", ["simctl", "runtime", "delete", i.runtimeId]), run: () => simctl(["runtime", "delete", i.runtimeId], 600_000) });
   }
   if (chosen.some((x) => x.action.startsWith("sim") || x.action === "runtime-delete")) warnings.push("Simulators and runtimes are removed for good, not moved to the Trash. Xcode can download runtimes again.");
   if (chosen.some((i) => i.action === "pnpm-prune")) {
