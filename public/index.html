@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="token" content="__TOKEN__" />
+    <meta name="dry-forced" content="__DRY__" />
+    <title>Mac Cleaner Pro</title>
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand"><img src="icon.svg" alt="" width="28" height="28" /><span>Mac Cleaner Pro</span></div>
+        <nav>
+          <button class="nav" data-view="ram"><span class="nav-ico" data-icon="chip"></span><span><b>Memory</b><small id="nav-ram">Free up RAM</small></span></button>
+          <button class="nav" data-view="disk"><span class="nav-ico" data-icon="disk"></span><span><b>Disk space</b><small id="nav-disk">Find junk files</small></span></button>
+          <button class="nav" data-view="startup"><span class="nav-ico" data-icon="power"></span><span><b>Startup</b><small id="nav-startup">What runs at login</small></span></button>
+        </nav>
+        <div class="sidebar-foot">
+          <label class="switch" title="When on, every action only shows what it would do.">
+            <input type="checkbox" id="practice" />
+            <span class="track"><span class="thumb"></span></span>
+            <span><b>Practice mode</b><small>Actions only pretend</small></span>
+          </label>
+          <p class="fine">Runs only on this Mac at 127.0.0.1. Nothing is sent anywhere.</p>
+        </div>
+      </aside>
+      <main id="main"></main>
+    </div>
+    <dialog id="modal"></dialog>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script src="app.js" type="module"></script>
+  </body>
+</html>

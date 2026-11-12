@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "mac-cleaner-pro",
+      "runtimeExecutable": "/usr/bin/env",
+      "runtimeArgs": ["NO_OPEN=1", "node", "server/index.js"],
+      "port": 4477,
+      "url": "http://127.0.0.1:4477"
+    }
+  ]
+}

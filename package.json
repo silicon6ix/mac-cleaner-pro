@@ -1,0 +1,17 @@
+{
+  "name": "mac-cleaner-pro",
+  "version": "0.1.0",
+  "description": "A local web page that frees memory, disk space and startup items on a Mac used for iOS and web development.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node --watch-path=server --watch-path=public server/index.js",
+    "start": "node server/index.js",
+    "dry": "DRY_RUN=1 node server/index.js",
+    "check": "node --check server/index.js && node server/selftest.js"
+  },
+  "license": "MIT"
+}
